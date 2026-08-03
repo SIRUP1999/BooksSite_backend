@@ -221,44 +221,58 @@ app.post("/api/payment/webhook", express.raw({ type: "application/json" }), asyn
 
   if (event.event !== "charge.success") return;
 
-  const { reference, metadata, customer, amount, currency } = event.data;
-
-  // Idempotency — skip if already processed
-  const { data: usedRef } = await supabase
-    .from("used_payment_refs")
-    .select("reference")
-    .eq("reference", reference)
-    .single();
-  if (usedRef) return;
-
-  const bookId = metadata?.bookId;
-  if (!bookId) return;
-
-  const { data: book } = await supabase.from("books").select("*").eq("id", Number(bookId)).single();
-  if (!book) return;
-
-  const orderData = {
-    bookId: book.id,
-    bookTitle: book.title,
-    email: customer.email,
-    name: metadata.name || customer.email,
-    amount: amount / 100,
-    currency,
-    reference,
-    emailDelivered: false,
-    paidAt: new Date().toISOString(),
-  };
-
-  const { data: order } = await supabase.from("orders").insert([orderData]).select().single();
-  await supabase.from("used_payment_refs").insert([{ reference }]);
-  await supabase.from("books").update({ downloads: (book.downloads || 0) + 1 }).eq("id", book.id);
-
   try {
-    const pdfBytes = await generateBookPDF(book);
-    await sendBookEmail(customer.email, metadata.name || "Beloved", book, pdfBytes);
-    await supabase.from("orders").update({ emailDelivered: true }).eq("reference", reference);
-  } catch (emailErr) {
-    console.error(`[WEBHOOK DELIVERY FAILURE] ${customer.email}:`, emailErr.message);
+    const { reference, metadata, customer, amount, currency } = event.data;
+
+    // Idempotency — skip if already processed
+    const { data: usedRef } = await supabase
+      .from("used_payment_refs")
+      .select("reference")
+      .eq("reference", reference)
+      .single();
+    if (usedRef) return;
+
+    const bookId = metadata?.bookId;
+    if (!bookId) return;
+
+    const { data: book } = await supabase.from("books").select("*").eq("id", Number(bookId)).single();
+    if (!book) return;
+
+    // Verify the amount actually paid matches the book's real price —
+    // never trust webhook amount blindly, since it originates from an
+    // external call and this is an independent fulfilment path.
+    const expectedAmount = Math.round(toNumber(book.price, 0) * 100);
+    if (amount !== expectedAmount || currency !== "GHS") {
+      console.error(`[WEBHOOK] Amount mismatch for ref ${reference}: got ${amount} ${currency}, expected ${expectedAmount} GHS`);
+      return; // don't fulfil — mismatched payment
+    }
+
+    const orderData = {
+      bookId: book.id,
+      bookTitle: book.title,
+      email: customer.email,
+      name: metadata.name || customer.email,
+      amount: amount / 100,
+      currency,
+      reference,
+      emailDelivered: false,
+      paidAt: new Date().toISOString(),
+    };
+
+    const { data: order } = await supabase.from("orders").insert([orderData]).select().single();
+    await supabase.from("used_payment_refs").insert([{ reference }]);
+    await supabase.from("books").update({ downloads: (book.downloads || 0) + 1 }).eq("id", book.id);
+
+    try {
+      const pdfBytes = await generateBookPDF(book);
+      await sendBookEmail(customer.email, metadata.name || "Beloved", book, pdfBytes);
+      await supabase.from("orders").update({ emailDelivered: true }).eq("reference", reference);
+    } catch (emailErr) {
+      console.error(`[WEBHOOK DELIVERY FAILURE] ${customer.email}:`, emailErr.message);
+    }
+  } catch (err) {
+    // Prevent an unhandled rejection here from crashing the whole process
+    console.error("[WEBHOOK PROCESSING ERROR]", err.message);
   }
 });
 
@@ -290,10 +304,11 @@ app.use(express.json({ limit: "10mb" }));
 // ─── Rate limiting (applied per-route) ────────────────────────────────────
 app.use("/api/login", rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { error: "Too many attempts" } }));
 app.use("/api/books/:id/download", rateLimit({ windowMs: 60 * 1000, max: 5, message: { error: "Too many downloads. Wait a minute." } }));
-// ✅ NEW: Protect spam-able public endpoints
 app.use("/api/newsletter", rateLimit({ windowMs: 60 * 60 * 1000, max: 5, message: { error: "Too many signups from this IP" } }));
 app.use("/api/inquiries", rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: "Too many messages from this IP" } }));
 app.use("/api/payment/initialize", rateLimit({ windowMs: 60 * 60 * 1000, max: 20, message: { error: "Too many payment attempts from this IP" } }));
+// ✅ NEW: Prevent review spam
+app.use("/api/books/:id/reviews", rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: { error: "Too many reviews from this IP" } }));
 
 // ─── Auth middleware ───────────────────────────────────────────────────────
 const authMiddleware = (req, res, next) => {
@@ -410,18 +425,24 @@ app.get("/api/books/:id/download", async (req, res) => {
 
 // ─── PAYSTACK: INITIALIZE ──────────────────────────────────────────────────
 app.post("/api/payment/initialize", async (req, res) => {
-  const { email, name, bookId, amount } = req.body;
-  if (!email || !bookId || !amount) return res.status(400).json({ error: "Missing fields" });
-  if (amount <= 0) return res.status(400).json({ error: "Invalid amount" });
+  const { email, name, bookId } = req.body;
+  if (!email || !bookId) return res.status(400).json({ error: "Missing fields" });
+
+  // Never trust a client-supplied amount — look up the real price server-side.
+  const { data: book, error: bookErr } = await supabase.from("books").select("price").eq("id", bookId).single();
+  if (bookErr || !book) return res.status(404).json({ error: "Book not found" });
+  if (!book.price || book.price <= 0) return res.status(400).json({ error: "Invalid book price" });
+
   try {
     const response = await axios.post("https://api.paystack.co/transaction/initialize", {
-      email, amount: Math.round(amount * 100), currency: "GHS",
+      email, amount: Math.round(book.price * 100), currency: "GHS",
       metadata: { bookId, name, email },
       callback_url: `${FRONTEND_URL}?payment=success`,
     }, { headers: { Authorization: `Bearer ${PAYSTACK_SECRET}` } });
     res.json(response.data);
   } catch (err) {
-    res.status(500).json({ error: "Payment initialization failed", detail: err.message });
+    console.error("Payment initialization error:", err.response?.data || err.message);
+    res.status(500).json({ error: "Payment initialization failed" });
   }
 });
 
@@ -479,7 +500,7 @@ app.post("/api/payment/verify", async (req, res) => {
     res.json({ ok: true, order });
   } catch (err) {
     console.error("Payment verify error:", err.response?.data || err.message);
-    res.status(500).json({ error: "Verification failed", detail: err.message });
+    res.status(500).json({ error: "Verification failed" });
   }
 });
 
@@ -802,7 +823,7 @@ app.use((err, req, res, next) => {
   if (err.message && err.message.startsWith("CORS:")) {
     return res.status(403).json({ error: err.message });
   }
-  return res.status(500).json({ error: err.message || "Internal server error" });
+  return res.status(500).json({ error: "Internal server error" });
 });
 
 app.listen(PORT, () => console.log(`✦ The Open Scroll running on http://localhost:${PORT}`));
